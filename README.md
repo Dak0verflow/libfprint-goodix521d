@@ -1,3 +1,10 @@
+> **This is a fork** adding a dual-boot-safe driver for the **Goodix 27c6:521d**
+> fingerprint sensor (ASUS ROG Zephyrus G14 GA401 and others): it reuses the
+> pairing key Windows provisioned and never flashes the sensor.
+> **See [goodix521d/README.md](goodix521d/README.md)** for install and setup, and
+> [goodix521d/PROTOCOL.md](goodix521d/PROTOCOL.md) for the protocol notes.
+> Upstream libfprint: https://gitlab.freedesktop.org/libfprint/libfprint
+
 
 
 <div align="center">
