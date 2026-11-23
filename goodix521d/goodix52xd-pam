@@ -1,0 +1,36 @@
+#!/bin/bash
+# Opt-in: allow fingerprint for a PAM service, with password fallback.
+#   sudo goodix52xd-pam [service]          (default: sudo)
+#   sudo goodix52xd-pam [service] --undo
+# e.g. service = sudo, polkit-1 (KDE admin popups)
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+SVC="sudo"; UNDO=0
+for a in "$@"; do
+    case "$a" in --undo) UNDO=1 ;; *) SVC="$a" ;; esac
+done
+F="/etc/pam.d/$SVC"
+VENDOR="/usr/lib/pam.d/$SVC"
+MARK="/etc/pam.d/.$SVC.created-by-goodix521d"
+LINE="auth       sufficient   pam_fprintd.so max-tries=3 timeout=15"
+
+if [ "$UNDO" = 1 ]; then
+    if [ -e "$MARK" ]; then
+        rm -f "$F" "$MARK"; echo "removed override $F (vendor $VENDOR applies again)"
+    else
+        sed -i '/pam_fprintd.so/d' "$F"; echo "removed fingerprint from $F"
+    fi
+    exit 0
+fi
+
+if [ ! -e "$F" ]; then
+    [ -e "$VENDOR" ] || { echo "no PAM service '$SVC'"; exit 1; }
+    cp -a "$VENDOR" "$F"; touch "$MARK"
+    echo "created $F from $VENDOR (overrides it; survives package updates)"
+fi
+grep -q pam_fprintd.so "$F" && { echo "already enabled in $F"; exit 0; }
+cp -a "$F" "$F.bak-goodix521d"
+# insert before the first auth line so fingerprint is tried first, password after
+awk -v l="$LINE" 'BEGIN{d=0} /^auth/ && !d {print l; d=1} {print}' "$F.bak-goodix521d" > "$F"
+echo "enabled for '$SVC'. $F now starts with:"; grep -n "^auth" "$F" | head -3
+echo "backup: $F.bak-goodix521d   (keep a root shell open while testing: sudo -s)"

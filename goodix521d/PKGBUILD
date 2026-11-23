@@ -1,7 +1,7 @@
 # libfprint 1.94.100 + goodixtls52xd (Goodix 27c6:521d, dual-boot safe)
 pkgname=libfprint-goodix521d
 pkgver=1.94.100
-pkgrel=1
+pkgrel=2
 pkgdesc="libfprint with a dual-boot-safe driver for the Goodix 27c6:521d fingerprint sensor"
 arch=(x86_64)
 url="https://github.com/Dak0verflow/libfprint-goodix521d"
@@ -31,5 +31,6 @@ build() {
 package() {
   meson install -C build --destdir "$pkgdir"
   install -Dm755 "$_src/goodix521d/goodix52xd-setup" "$pkgdir/usr/bin/goodix52xd-setup"
+  install -Dm755 "$_src/goodix521d/goodix52xd-pam" "$pkgdir/usr/bin/goodix52xd-pam"
   install -dm700 "$pkgdir/var/lib/fprint/goodixtls52xd"
 }

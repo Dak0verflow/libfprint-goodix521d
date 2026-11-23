@@ -41,13 +41,17 @@ Other changes from earlier drivers:
 ```sh
 git clone https://github.com/Dak0verflow/libfprint-goodix521d
 cd libfprint-goodix521d/goodix521d
-makepkg -si                       # replaces the libfprint package
+makepkg -si                       # answer "y" to remove libfprint (this replaces it)
 sudo goodix52xd-setup status      # read-only check
 sudo goodix52xd-setup pair        # recover the pairing key from Windows
 sudo goodix52xd-setup calibrate   # 20 touches, different fingers/positions
 fprintd-enroll                    # 15 touches, vary placement
 fprintd-verify
 ```
+
+On KDE Plasma you can enroll from the GUI instead: **System Settings → Users →
+Configure Fingerprint Authentication**. KDE's login and lock screen use the
+fingerprint out of the box.
 
 To undo: `sudo pacman -S libfprint`, then optionally
 `sudo rm -r /var/lib/fprint/goodixtls52xd`.
@@ -56,10 +60,20 @@ If Windows ever re-pairs the sensor (e.g. after reinstalling Windows or the
 Goodix driver), the driver reports "Sensor pairing key changed". Re-run
 `goodix52xd-setup pair`.
 
-### Using it for sudo / login
+### Using it for sudo and admin popups
 
-Add `auth sufficient pam_fprintd.so` above the first `auth` line of the PAM file
-you want (e.g. `/etc/pam.d/sudo`). Keep a root shell open while testing.
+`goodix52xd-pam` turns fingerprint on for a PAM service, with password fallback
+(3 tries or 15 s, or Ctrl+C in a terminal):
+
+```sh
+sudo goodix52xd-pam            # terminal sudo
+sudo goodix52xd-pam polkit-1   # KDE/GNOME admin popups (e.g. Partition Manager)
+sudo goodix52xd-pam polkit-1 --undo
+```
+
+For services whose PAM file only exists in `/usr/lib/pam.d` (like `polkit-1`),
+it creates an override in `/etc/pam.d`, so package updates don't revert it.
+Keep a root shell open (`sudo -s`) while testing PAM changes.
 
 ## Accuracy (one device, one user; small numbers)
 
@@ -68,6 +82,7 @@ you want (e.g. `/etc/pam.d/sudo`). Keep a root shell open while testing.
 | offline: 3 fingers x 20 touches, 10-sample templates | 0 / 360 impostor accepts; about 27 % of single genuine attempts rejected (default thresholds) |
 | live: enrolled right index | 5 / 5 accepted |
 | live: other fingers | 5 / 5 rejected |
+| daily use so far | KDE login, lock screen, sudo, polkit popups |
 
 These numbers are far too small to state a false-accept rate. More data from
 more people and devices is needed before relying on this as the only factor.
