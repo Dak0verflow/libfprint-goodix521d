@@ -256,12 +256,18 @@ foreach i : driver_helpers
         if not opencv_pc.found()
             error('OpenCV is required for @0@'.format(driver))
         endif
+        # Build the dependency by hand: anything that still references the
+        # opencv pkg-config package (e.g. g-ir-scanner) would pull in all modules.
         opencv_libdir = opencv_pc.get_variable(pkgconfig: 'libdir', default_value: '')
-        optional_deps += opencv_pc.partial_dependency(compile_args: true, includes: true)
+        opencv_cflags = run_command(find_program('pkg-config'), '--cflags-only-I',
+                                    opencv_pc.name(), check: true).stdout().strip().split()
+        opencv_libs = []
         foreach m : opencv_modules
-            optional_deps += cc.find_library('opencv_' + m,
-                                             dirs: opencv_libdir != '' ? [opencv_libdir] : [])
+            opencv_libs += cc.find_library('opencv_' + m,
+                                           dirs: opencv_libdir != '' ? [opencv_libdir] : [])
         endforeach
+        optional_deps += declare_dependency(compile_args: opencv_cflags,
+                                            dependencies: opencv_libs)
     elif i == 'udev'
         install_udev_rules = true
 
