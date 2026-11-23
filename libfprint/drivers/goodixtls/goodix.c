@@ -178,7 +178,7 @@ void goodix_receive_preset_psk_read(FpDevice *dev, guint8 *data, guint16 length,
     return;
   }
   
-  GoodixPresetPskResponse* response = data + sizeof(guint8);
+  GoodixPresetPskResponse* response = (GoodixPresetPskResponse*) (data + sizeof(guint8));
   psk_len = response->length;
   if (length < psk_len + sizeof(guint8) + sizeof(GoodixPresetPskResponse)) {
     g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
@@ -507,9 +507,15 @@ void goodix_send_protocol(
 
     fp_dbg("Running command: 0x%02x", cmd);
 
-    if (timeout_ms)
+    if (timeout_ms) {
         priv->timeout = fpi_device_add_timeout(
             dev, timeout_ms, goodix_receive_timeout_cb, NULL, NULL);
+        /* fpi_device_add_timeout() uses the context's cached time, which is
+         * stale if the main loop was not iterated for a while (e.g. a client
+         * blocked on input) and makes the timeout fire immediately. */
+        g_source_set_ready_time(priv->timeout,
+                                g_get_monotonic_time() + timeout_ms * (gint64) 1000);
+    }
     priv->cmd = cmd;
     priv->ack = TRUE;
     priv->reply = reply;
@@ -633,7 +639,7 @@ void goodix_send_mcu_switch_to_fdt_mode(FpDevice *dev, guint8 *mode,
     cb_info->user_data = user_data;
 
     goodix_send_protocol(dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, mode, length,
-                         free_func, TRUE, 0, reply, goodix_receive_default,
+                         free_func, TRUE, GOODIX_TIMEOUT, reply, goodix_receive_default,
                          cb_info);
     return;
   }
@@ -932,7 +938,7 @@ void goodix_send_tls_successfully_established(FpDevice *dev,
 void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
                           gpointer user_data)
 {
-    guint8 payload = {0x40, 0x00};
+    guint8 payload[] = {0x00, 0x00};
     GoodixCallbackInfo* cb_info;
 
     if (callback) {
@@ -941,13 +947,13 @@ void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
         cb_info->callback = G_CALLBACK(callback);
         cb_info->user_data = user_data;
 
-        goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, (guint8*) &payload,
+        goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, payload,
                              sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                              goodix_receive_default, cb_info);
         return;
     }
 
-    goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, (guint8*) &payload,
+    goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, payload,
                          sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                          NULL, NULL);
 }
@@ -989,7 +995,8 @@ void goodix_send_preset_psk_read(FpDevice *dev, guint32 flags, guint16 length,
                                  gpointer user_data) {
   GoodixPresetPsk payload = {.flags = GUINT32_TO_LE(flags),
                              .length = GUINT32_TO_LE(length),
-                             .offset = GUINT16_TO_LE(0)};
+                             .offset = GUINT32_TO_LE(0),
+                             .reserved = 0};
   GoodixCallbackInfo *cb_info;
 
   if (callback) {
@@ -1149,9 +1156,15 @@ static void on_tls_successfully_established(FpDevice* dev, gpointer user_data,
 }
 static void tls_handshake_done(FpiSsm* ssm, FpDevice* dev, GError* error)
 {
+    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
+    FpiDeviceGoodixTlsPrivate* priv =
+        fpi_device_goodixtls_get_instance_private(self);
+
     if (error) {
-        fp_dbg("failed to do tls handshake: %s (code: %d)", error->message,
-               error->code);
+        fp_warn("TLS handshake failed: %s", error->message);
+        ((GoodixNoneCallback) priv->tls_ready_callback->callback)(
+            dev, priv->tls_ready_callback->user_data, error);
+        return;
     }
     goodix_send_tls_successfully_established(
         dev, on_tls_successfully_established, NULL);
@@ -1215,12 +1228,13 @@ static void on_goodix_request_tls_connection(FpDevice* dev, guint8* data,
                                              guint16 length, gpointer user_data,
                                              GError* error)
 {
+    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(user_data);
     if (error) {
-        fp_err("failed to get tls handshake: %s", error->message);
-        goodix_send_tls_successfully_established(FP_DEVICE(dev), NULL, NULL);
+        FpiDeviceGoodixTlsPrivate* p = fpi_device_goodixtls_get_instance_private(self);
+        ((GoodixNoneCallback) p->tls_ready_callback->callback)(
+            dev, p->tls_ready_callback->user_data, error);
         return;
     }
-    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(user_data);
     FpiDeviceGoodixTlsPrivate* priv =
         fpi_device_goodixtls_get_instance_private(self);
 
@@ -1232,8 +1246,10 @@ static void on_goodix_request_tls_connection(FpDevice* dev, guint8* data,
 static void goodix_tls_ready(GoodixTlsServer* server, GError* err, gpointer dev)
 {
     if (err) {
-        fp_err("failed to init tls server: %s, code: %d", err->message,
-               err->code);
+        FpiDeviceGoodixTlsPrivate* priv = fpi_device_goodixtls_get_instance_private(
+            FPI_DEVICE_GOODIXTLS(dev));
+        ((GoodixNoneCallback) priv->tls_ready_callback->callback)(
+            FP_DEVICE(dev), priv->tls_ready_callback->user_data, err);
         return;
     }
     goodix_send_request_tls_connection(FP_DEVICE(dev),
@@ -1263,8 +1279,8 @@ void goodix_tls(FpDevice* dev, GoodixNoneCallback callback, gpointer user_data)
     s->user_data = self;
     GError* err = NULL;
     if (!goodix_tls_server_init(priv->tls_hop, &err)) {
-        fp_err("failed to init tls server, error: %s, code: %d", err->message,
-               err->code);
+        g_clear_pointer(&priv->tls_hop, g_free);
+        callback(dev, user_data, err);
         return;
     }
 

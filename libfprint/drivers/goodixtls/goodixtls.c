@@ -38,36 +38,37 @@
 #include "goodix.h"
 #include "goodixtls.h"
 
-static GError* err_from_ssl()
+static guint8 goodix_tls_psk[64];
+static gsize goodix_tls_psk_len;
+
+void goodix_tls_set_psk(const guint8* psk, gsize len)
 {
-    GError* err = malloc(sizeof(GError));
-    unsigned long code = ERR_get_error();
-    err->code = code;
-    const char* msg = ERR_reason_error_string(code);
-    err->message = malloc(strlen(msg));
-    strcpy(err->message, msg);
-    return err;
+    g_assert(len <= sizeof(goodix_tls_psk));
+    memcpy(goodix_tls_psk, psk, len);
+    goodix_tls_psk_len = len;
 }
 
-static unsigned int tls_server_psk_server_callback(SSL *ssl,
-                                                   const char *identity,
-                                                   unsigned char *psk,
-                                                   unsigned int max_psk_len) {
-  if (sizeof(goodix_511_psk_0) > max_psk_len) {
-    fp_dbg("Provided PSK R is too long for OpenSSL");
-    return 0;
-  }
-  fp_dbg("PSK WANTED %d", max_psk_len);
-  // I don't know why we must use OPENSSL_hexstr2buf but just copying zeros
-  // doesn't work
-  const char* buff = "000000000000000000000000000000000000000000000000000000000"
-                     "0000000";
-  long len = 0;
-  unsigned char* key = OPENSSL_hexstr2buf(buff, &len);
-  memcpy(psk, key, len);
-  OPENSSL_free(key);
+static GError* err_from_ssl(void)
+{
+    unsigned long code = ERR_get_error();
+    const char* msg = ERR_reason_error_string(code);
 
-  return len;
+    return g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO, "TLS: %s",
+                       msg ? msg : "unknown error");
+}
+
+static unsigned int tls_server_psk_server_callback(SSL* ssl,
+                                                   const char* identity,
+                                                   unsigned char* psk,
+                                                   unsigned int max_psk_len)
+{
+    if (goodix_tls_psk_len == 0 || goodix_tls_psk_len > max_psk_len) {
+        fp_warn("TLS PSK unavailable (len %" G_GSIZE_FORMAT ", max %u)",
+                goodix_tls_psk_len, max_psk_len);
+        return 0;
+    }
+    memcpy(psk, goodix_tls_psk, goodix_tls_psk_len);
+    return goodix_tls_psk_len;
 }
 
 static SSL_CTX* tls_server_create_ctx(void)
@@ -88,7 +89,7 @@ static void tls_server_config_ctx(SSL_CTX* ctx)
 {
     SSL_CTX_set_ecdh_auto(ctx, 1);
     SSL_CTX_set_dh_auto(ctx, 1);
-    SSL_CTX_set_cipher_list(ctx, "ALL");
+    SSL_CTX_set_cipher_list(ctx, "ALL:@SECLEVEL=0");
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_psk_server_callback(ctx, tls_server_psk_server_callback);
@@ -117,7 +118,7 @@ static void tls_config_ssl(SSL* ssl)
     SSL_set_min_proto_version(ssl, TLS1_2_VERSION);
     SSL_set_max_proto_version(ssl, TLS1_2_VERSION);
     SSL_set_psk_server_callback(ssl, tls_server_psk_server_callback);
-    SSL_set_cipher_list(ssl, "ALL");
+    SSL_set_cipher_list(ssl, "ALL:@SECLEVEL=0");
 }
 
 static void* goodix_tls_init_serve(void* me)

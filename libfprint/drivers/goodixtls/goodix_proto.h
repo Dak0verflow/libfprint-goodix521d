@@ -45,6 +45,7 @@
 #define GOODIX_CMD_FIRMWARE_VERSION (0xa8)
 #define GOODIX_CMD_QUERY_MCU_STATE (0xae)
 #define GOODIX_CMD_ACK (0xb0)
+#define GOODIX_CMD_SET_DRV_STATE (0xc4)
 #define GOODIX_CMD_REQUEST_TLS_CONNECTION (0xd0)
 #define GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED (0xd4)
 #define GOODIX_CMD_PRESET_PSK_WRITE (0xe0)
@@ -113,6 +114,7 @@ typedef struct __attribute__((__packed__)) _GoodixPresetPsk {
   guint32 length;
   guint32 offset;
   guint32 flags;
+  guint32 reserved; /* 521d (GM168) firmware requires the 16-byte form */
 } GoodixPresetPsk;
 
 typedef struct __attribute__((__packed__)) _GoodixPresetPskResponse {
