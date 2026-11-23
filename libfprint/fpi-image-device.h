@@ -21,6 +21,7 @@
 
 #include "fpi-device.h"
 #include "fp-image-device.h"
+#include "fpi-print.h"
 
 /**
  * FpiImageDeviceState:
@@ -114,6 +115,22 @@ struct _FpImageDeviceClass
   void          (*change_state) (FpImageDevice      *dev,
                                  FpiImageDeviceState state);
   void          (*deactivate)   (FpImageDevice *dev);
+
+  /* Optional custom matcher (goodix521d patch). If print_from_image is set,
+   * NBIS minutiae detection and bozorth3 matching are bypassed: the driver
+   * turns each captured image into an FPI_PRINT_RAW sample print, appends
+   * samples to the enrollment template and scores probes itself. */
+  gboolean       (*print_from_image) (FpImageDevice *dev,
+                                      FpImage       *image,
+                                      FpPrint       *print,
+                                      GError       **error);
+  void           (*print_append)     (FpImageDevice *dev,
+                                      FpPrint       *template_print,
+                                      FpPrint       *sample);
+  FpiMatchResult (*print_match)      (FpImageDevice *dev,
+                                      FpPrint       *template_print,
+                                      FpPrint       *probe,
+                                      GError       **error);
 };
 
 void fpi_image_device_set_bz3_threshold (FpImageDevice *self,

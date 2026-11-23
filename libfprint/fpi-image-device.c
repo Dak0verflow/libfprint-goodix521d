@@ -238,14 +238,30 @@ fp_image_device_maybe_complete_action (FpImageDevice *self, GError *error)
     }
 }
 
+static void fpi_image_device_process_image (FpImageDevice *self,
+                                            FpImage       *image,
+                                            GError        *error);
+
 static void
 fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
-  g_autoptr(FpImage) image = FP_IMAGE (source_object);
-  g_autoptr(FpPrint) print = NULL;
+  FpImage *image = FP_IMAGE (source_object);
   GError *error = NULL;
-  FpImageDevice *self = FP_IMAGE_DEVICE (user_data);
+
+  fp_image_detect_minutiae_finish (image, res, &error);
+  /* process_image takes ownership of the image reference */
+  fpi_image_device_process_image (FP_IMAGE_DEVICE (user_data), image, error);
+}
+
+static void
+fpi_image_device_process_image (FpImageDevice *self,
+                                FpImage       *image_in,
+                                GError        *error)
+{
+  g_autoptr(FpImage) image = image_in;
+  g_autoptr(FpPrint) print = NULL;
   FpDevice *device = FP_DEVICE (self);
+  FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
   FpImageDevicePrivate *priv;
   FpiDeviceAction action;
 
@@ -253,7 +269,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
   priv = fp_image_device_get_instance_private (FP_IMAGE_DEVICE (device));
   priv->minutiae_scan_active = FALSE;
 
-  if (!fp_image_detect_minutiae_finish (image, res, &error))
+  if (error)
     {
       /* Cancel operation . */
       if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
@@ -281,9 +297,20 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
 
   if (!error)
     {
+      gboolean ok;
+
       print = fp_print_new (device);
-      fpi_print_set_type (print, FPI_PRINT_NBIS);
-      if (!fpi_print_add_from_image (print, image, &error))
+      if (cls->print_from_image)
+        {
+          fpi_print_set_type (print, FPI_PRINT_RAW);
+          ok = cls->print_from_image (self, image, print, &error);
+        }
+      else
+        {
+          fpi_print_set_type (print, FPI_PRINT_NBIS);
+          ok = fpi_print_add_from_image (print, image, &error);
+        }
+      if (!ok)
         {
           g_clear_object (&print);
 
@@ -304,7 +331,10 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
 
       if (print)
         {
-          fpi_print_add_print (enroll_print, print);
+          if (cls->print_append)
+            cls->print_append (self, enroll_print, print);
+          else
+            fpi_print_add_print (enroll_print, print);
           priv->enroll_stage += 1;
         }
 
@@ -333,7 +363,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
         {
           FpPrint *template = g_ptr_array_index (templates, i);
 
-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
+          FpiMatchResult r;
+
+          if (!print)
+            break;
+          if (cls->print_match)
+            r = cls->print_match (self, template, print, &error);
+          else
+            r = fpi_print_bz3_match (template, print, priv->bz3_threshold, &error);
+          if (r == FPI_MATCH_SUCCESS)
             {
               result = template;
               break;
@@ -465,6 +503,12 @@ fpi_image_device_report_finger_status (FpImageDevice *self,
  * including e.g. an enroll operation which captures multiple images during
  * one session.
  */
+static void
+fpi_image_device_custom_process_cb (FpDevice *device, gpointer user_data)
+{
+  fpi_image_device_process_image (FP_IMAGE_DEVICE (device), FP_IMAGE (user_data), NULL);
+}
+
 void
 fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
 {
@@ -482,6 +526,18 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
   g_debug ("Image device captured an image");
 
   priv->minutiae_scan_active = TRUE;
+
+  if (FP_IMAGE_DEVICE_GET_CLASS (self)->print_from_image)
+    {
+      /* Custom matcher: no NBIS. Process from an idle so that the state
+       * change below happens first, exactly like the async NBIS path. */
+      /* image is (transfer full); process_image releases it */
+      fpi_device_add_timeout (FP_DEVICE (self), 0,
+                              (FpTimeoutFunc) fpi_image_device_custom_process_cb,
+                              image, NULL);
+      fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
+      return;
+    }
 
   /* XXX: We also detect minutiae in capture mode, we solely do this
    *      to normalize the image which will happen as a by-product. */
