@@ -844,6 +844,11 @@ dev_change_state (FpImageDevice *img_dev, FpiImageDeviceState state)
       scan_schedule (self, G52_POLL_MS);
       break;
 
+    case FPI_IMAGE_DEVICE_STATE_INACTIVE:
+    case FPI_IMAGE_DEVICE_STATE_ACTIVATING:
+    case FPI_IMAGE_DEVICE_STATE_DEACTIVATING:
+    case FPI_IMAGE_DEVICE_STATE_IDLE:
+    case FPI_IMAGE_DEVICE_STATE_CAPTURE:
     default:
       break;
     }

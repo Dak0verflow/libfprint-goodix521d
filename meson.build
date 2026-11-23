@@ -245,14 +245,29 @@ foreach i : driver_helpers
 
         optional_deps += openssl_dep
     elif i == 'opencv'
-        opencv_dep = dependency('opencv5', required: false)
-        if not opencv_dep.found()
-            opencv_dep = dependency('opencv4', required: false)
+        # Only link the modules the driver uses: the opencv pkg-config file
+        # lists every module (incl. viz -> vtk), which needn't be installed.
+        opencv_pc = dependency('opencv5', required: false)
+        opencv_modules = ['core', 'imgproc', 'geometry', 'flann', 'features']
+        if not opencv_pc.found()
+            opencv_pc = dependency('opencv4', required: false)
+            opencv_modules = ['core', 'imgproc', 'flann', 'features2d']
         endif
-        if not opencv_dep.found()
+        if not opencv_pc.found()
             error('OpenCV is required for @0@'.format(driver))
         endif
-        optional_deps += opencv_dep
+        # Build the dependency by hand: anything that still references the
+        # opencv pkg-config package (e.g. g-ir-scanner) would pull in all modules.
+        opencv_libdir = opencv_pc.get_variable(pkgconfig: 'libdir', default_value: '')
+        opencv_cflags = run_command(find_program('pkg-config'), '--cflags-only-I',
+                                    opencv_pc.name(), check: true).stdout().strip().split()
+        opencv_libs = []
+        foreach m : opencv_modules
+            opencv_libs += cc.find_library('opencv_' + m,
+                                           dirs: opencv_libdir != '' ? [opencv_libdir] : [])
+        endforeach
+        optional_deps += declare_dependency(compile_args: opencv_cflags,
+                                            dependencies: opencv_libs)
     elif i == 'udev'
         install_udev_rules = true
 
