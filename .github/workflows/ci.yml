@@ -1,0 +1,94 @@
+# CI for the goodix521d fork. Mirrors the core of upstream libfprint's
+# .gitlab-ci.yml (Fedora build with --werror, meson test, sanitizers) and adds
+# checks for the Arch package and the goodix521d tools.
+name: CI
+
+on:
+  push:
+    branches: [goodix521d]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fedora:
+    name: Fedora (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [werror-test, sanitizers]
+    steps:
+      - name: Install dependencies
+        run: >
+          dnf -y install git gcc gcc-c++ meson ninja-build
+          glib2-devel gobject-introspection-devel libgusb-devel libgudev-devel
+          openssl-devel pixman-devel opencv-devel
+          python3-gobject python3-cairo umockdev systemd libasan libubsan
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          opts="-Ddrivers=all -Ddoc=false -Dgtk-examples=false"
+          if [ "${{ matrix.variant }}" = sanitizers ]; then
+            opts="$opts -Db_sanitize=address,undefined"
+          else
+            opts="$opts --werror"
+          fi
+          meson setup _build $opts
+
+      - name: Build
+        run: meson compile -C _build
+
+      - name: Test
+        run: meson test -C _build --print-errorlogs --no-stdsplit --timeout-multiplier 3
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meson-logs-${{ matrix.variant }}
+          path: _build/meson-logs
+
+  arch-package:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: >
+          pacman -Syu --noconfirm --needed base-devel git meson gobject-introspection
+          glib2 libgudev libgusb openssl pixman opencv python python-pyusb python-gobject
+
+      - uses: actions/checkout@v4
+
+      - name: makepkg
+        run: |
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/goodix521d' && makepkg --noconfirm"
+
+      - name: Install and smoke-test
+        run: |
+          pacman -U --noconfirm goodix521d/libfprint-goodix521d-*.pkg.tar.zst
+          test -f /usr/lib/libfprint-2.so.2
+          goodix52xd-setup --help >/dev/null
+          python3 -c "import gi; gi.require_version('FPrint', '2.0'); from gi.repository import FPrint; print('FPrint', FPrint.Context.new())"
+
+  tools:
+    name: goodix521d tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile goodix521d/goodix52xd-setup
+      - name: shellcheck
+        run: shellcheck goodix521d/goodix52xd-pam
