@@ -8,7 +8,7 @@ url="https://github.com/Dak0verflow/libfprint-goodix521d"
 license=(LGPL-2.1-or-later)
 depends=(glib2 libgudev libgusb openssl pixman opencv libgcc glibc python python-pyusb)
 optdepends=('impacket: goodix52xd-setup pair (recover the pairing key from Windows)')
-makedepends=(meson gobject-introspection git)
+makedepends=(meson gobject-introspection glib2-devel git)
 provides=("libfprint=$pkgver" libfprint-2.so)
 conflicts=(libfprint)
 
