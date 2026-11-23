@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: LGPL-2.1-or-later
+"""
+goodix52xd-setup — one-time setup for the goodixtls52xd libfprint driver
+(Goodix 27c6:521d, e.g. ASUS ROG Zephyrus G14 GA401).
+
+The sensor talks TLS-PSK. Windows' driver provisioned a random PSK and stores
+it, DPAPI-encrypted with the Windows SYSTEM account's keys, in the sensor's
+BB010002 record. This tool recovers that PSK from *your own* Windows install
+so Linux can use the same key — nothing is ever written to the sensor, so
+Windows Hello keeps working.
+
+  goodix52xd-setup status      read-only sensor check
+  goodix52xd-setup pair        recover the PSK from the Windows partition
+  goodix52xd-setup calibrate   learn the sensor's fixed pattern (20 touches)
+
+Run as root. Needs: python-pyusb; for `pair` also impacket.
+Sensor commands used: NOP, firmware version, PSK *read*, reset, OTP read,
+config upload (RAM), TLS, image capture. No flash/PSK writes.
+"""
+import argparse, contextlib, glob, hashlib, json, os, shutil, ssl, struct
+import subprocess, sys, tempfile, time, uuid
+
+STATE_DIR = "/var/lib/fprint/goodixtls52xd"
+VID, PID = 0x27C6, 0x521D
+
+# MCU config for the 52xd (from goodix-fp-dump / goodixtls; DAC values are
+# supplied per capture from OTP, so this block is not sensor-specific).
+CONFIG = bytes.fromhex(
+    "701160712c9d2cc91ce518fd00fd00fd03ba000180ca0008008400bec38600b1"
+    "b68800baba8a00b3b38c00bcbc8e00b1b19000bbbb9200b1b194000000960000"
+    "00980000009a000000d2000000d4000000d6000000d800000050000105d00000"
+    "00700000007200785674003412200010402a0102042200012024003200800001"
+    "005c000101560024205800010232000402660000027c00005882007f082a0182"
+    "072200012024001400800001405c00ea00560006145800040232000c02660000"
+    "027c000058820080082a0108005c000101540000016200080464001000660000"
+    "027c0000582a0108005c00e8005200080054000001660000027c00005820c50e")
+
+F_PROTO, F_TLS, F_TLS_DATA = 0xA0, 0xB0, 0xB2
+C_NOP, C_IMG, C_FDT, C_IDLE, C_WREG = 0x00, 0x20, 0x36, 0x70, 0x80
+C_CONFIG, C_RESET, C_OTP, C_FW, C_ACK = 0x90, 0xA2, 0xA6, 0xA8, 0xB0
+C_DRV, C_TLS, C_PSK_READ = 0xC4, 0xD0, 0xE4
+W, H = 64, 80
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------
+# USB transport
+
+def pack(payload, flags=F_PROTO):
+    hdr = bytes([flags]) + struct.pack("<H", len(payload))
+    return hdr + bytes([sum(hdr) & 0xFF]) + payload
+
+
+def proto(cmd, payload, checksum=True):
+    d = bytes([cmd]) + struct.pack("<H", len(payload) + 1) + payload
+    return d + bytes([(0xAA - sum(d)) & 0xFF if checksum else 0x88])
+
+
+class Sensor:
+    def __init__(self):
+        import usb.core, usb.util
+        self.usb, self.util = usb, usb.util
+        dev = usb.core.find(idVendor=VID, idProduct=PID)
+        if dev is None:
+            die("Goodix 27c6:521d not found")
+        with contextlib.suppress(usb.core.USBError):
+            dev.reset()
+        time.sleep(0.6)
+        self.dev = usb.core.find(idVendor=VID, idProduct=PID)
+        with contextlib.suppress(Exception):
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        self.dev.set_configuration()
+        self.drain()
+        self.dev.write(0x01, self._pad(pack(proto(C_NOP, b"\0\0\0\0", checksum=False))))
+        self.drain(0.2)
+        self.tls = None
+
+    @staticmethod
+    def _pad(d):
+        return d + b"\0" * (-len(d) % 64)
+
+    def close(self):
+        with contextlib.suppress(Exception):
+            self.cmd(C_IDLE, bytes([20, 0]), reply=False, timeout=1)
+        self.util.dispose_resources(self.dev)
+
+    def drain(self, t=0.3):
+        end = time.time() + t
+        while time.time() < end:
+            try:
+                self.dev.read(0x83, 0x10000, 50)
+            except self.usb.core.USBTimeoutError:
+                pass
+
+    def recv(self, want_cmd=None, want_flags=F_PROTO, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                raw = bytes(self.dev.read(0x83, 0x10000, int(max(0.05, end - time.time()) * 1000)))
+            except self.usb.core.USBTimeoutError:
+                break
+            if len(raw) < 4 or sum(raw[:3]) & 0xFF != raw[3]:
+                continue
+            n = struct.unpack("<H", raw[1:3])[0]
+            payload, flags = raw[4:4 + n], raw[0]
+            if flags != want_flags:
+                continue
+            if want_cmd is None:
+                return payload
+            ln = struct.unpack("<H", payload[1:3])[0]
+            if payload[0] == want_cmd:
+                return payload[3:2 + ln]
+        raise TimeoutError(f"no reply (cmd {want_cmd}, flags {want_flags:#x})")
+
+    def cmd(self, c, payload, reply=True, timeout=5.0):
+        self.dev.write(0x01, self._pad(pack(proto(c, payload))))
+        while True:
+            body = self.recv(C_ACK, timeout=timeout)
+            if body and body[0] == c:
+                break
+        return self.recv(c, timeout=timeout) if reply else None
+
+    # -- read-only queries
+    def firmware(self):
+        return self.cmd(C_FW, b"\0\0").split(b"\0")[0].decode()
+
+    def psk_read(self, flags, length):
+        r = self.cmd(C_PSK_READ, struct.pack("<IIII", length, 0, flags, 0))
+        if not r or r[0] != 0:
+            raise RuntimeError(f"PSK slot {flags:#x} not readable")
+        n = struct.unpack("<I", r[5:9])[0]
+        return r[9:9 + n]
+
+    # -- capture session
+    def start_session(self, psk):
+        r = self.cmd(C_RESET, bytes([0x05, 20]))
+        if not r or r[0] != 1:
+            die("sensor reset failed")
+        time.sleep(0.05)
+        self.drain(0.1)
+        otp = self.cmd(C_OTP, b"\0\0")
+        self.dac_clear = bytes([otp[42], otp[41], otp[42], otp[43]])
+        self.dac_finger = bytes([otp[45], otp[44], otp[45], otp[46]])
+        self._tls(psk)
+        if self.cmd(C_CONFIG, CONFIG)[0] != 1:
+            die("sensor rejected config")
+        self.cmd(C_DRV, b"\x01\x00", reply=False)
+        fdt = b"\x0d\x01" + b"".join(bytes([v, 1]) for v in self.dac_clear) + b"\0" * 16
+        self.cmd(C_FDT, fdt + b"\x00", reply=False)
+        self.cmd(C_FDT, fdt + b"\x01")
+
+    def _tls(self, psk):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+        ctx.set_ciphers("ALL:@SECLEVEL=0")
+        ctx.set_psk_server_callback(lambda identity: psk)
+        inc, out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        s = ctx.wrap_bio(inc, out, server_side=True)
+        self.dev.write(0x01, self._pad(pack(proto(C_TLS, b"\0\0"))))
+        while True:
+            body = self.recv(C_ACK)
+            if body and body[0] == C_TLS:
+                break
+        for _ in range(8):
+            inc.write(self.recv(None, F_TLS))
+            try:
+                s.do_handshake()
+                done = True
+            except ssl.SSLWantReadError:
+                done = False
+            data = out.read()
+            if data:
+                self.dev.write(0x01, self._pad(pack(data, F_TLS)))
+            if done:
+                time.sleep(0.01)
+                self.tls, self.tls_in = s, inc
+                return
+        die("TLS handshake did not complete (wrong key?)")
+
+    def frame(self, finger=True):
+        reg = b"\x05\x03" if finger else b"\x0a\x03"
+        dac, hi = (self.dac_finger, 0) if finger else (self.dac_clear, 1)
+        params = (b"\x45\x03" if finger else b"\x81\x03") + b"".join(bytes([v, hi]) for v in dac)
+        self.cmd(C_WREG, b"\x00\x2c\x02" + reg, reply=False)
+        self.dev.write(0x01, self._pad(pack(proto(C_IMG, params))))
+        while True:
+            body = self.recv(C_ACK)
+            if body and body[0] == C_IMG:
+                break
+        self.tls_in.write(self.recv(None, F_TLS_DATA)[9:])
+        data = b""
+        while len(data) < 7684:
+            data += self.tls.read(7684 - len(data))
+        self.cmd(C_WREG, b"\x00\x2c\x02\x0a\x02", reply=False)
+        px = []
+        for i in range(0, 7680, 6):
+            c = data[i:i + 6]
+            px += [((c[0] & 0xF) << 8) + c[1], (c[3] << 4) + (c[0] >> 4),
+                   ((c[5] & 0xF) << 8) + c[2], (c[4] << 4) + (c[5] >> 4)]
+        return px
+
+
+def coverage(px):
+    inner = [px[y * W + x] for y in range(4, H - 4) for x in range(4, W - 4)]
+    return sum(v < 3400 for v in inner) / len(inner)
+
+
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def fprintd_stopped():
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "fprintd"]).returncode == 0
+    if active:
+        subprocess.run(["systemctl", "stop", "fprintd"], check=False)
+    try:
+        yield
+    finally:
+        pass  # fprintd is D-Bus activated; it restarts on demand
+
+
+def write_state(name, data):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    path = os.path.join(STATE_DIR, name)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    return path
+
+
+def read_pairing(s):
+    record = s.psk_read(0xBB010002, 332)
+    validator = s.psk_read(0xBB020001, 32)
+    return record, validator
+
+
+def cmd_status(_):
+    with fprintd_stopped():
+        s = Sensor()
+        try:
+            fw = s.firmware()
+            record, validator = read_pairing(s)
+        finally:
+            s.close()
+    print(f"firmware:        {fw}")
+    print(f"supported:       {'yes' if fw.startswith('GFUSB_GM168SEC_APP_100') else 'NO'}")
+    print(f"Windows pairing: {'present' if record[4:20] == uuid.UUID('df9d8cd0-1501-11d1-8c7a-00c04fc297eb').bytes_le else 'not found'}")
+    print(f"master key id:   {uuid.UUID(bytes_le=record[24:40])}")
+    try:
+        psk = open(os.path.join(STATE_DIR, "psk.bin"), "rb").read()
+        ok = hashlib.sha256(psk).digest() == validator
+        print(f"installed key:   {'matches sensor' if ok else 'DOES NOT match sensor (re-run pair)'}")
+    except FileNotFoundError:
+        print("installed key:   none (run: goodix52xd-setup pair)")
+    print(f"fixed pattern:   {'calibrated' if os.path.exists(os.path.join(STATE_DIR, 'fpn.bin')) else 'not calibrated (run: goodix52xd-setup calibrate)'}")
+
+
+def windows_roots(explicit):
+    """Yield mounted Windows roots (read-only temporary mounts are cleaned up)."""
+    if explicit:
+        yield explicit
+        return
+    info = json.loads(subprocess.run(["lsblk", "-J", "-o", "PATH,FSTYPE,MOUNTPOINT"],
+                                     capture_output=True, text=True, check=True).stdout)
+
+    def walk(devs):
+        for d in devs:
+            yield d
+            yield from walk(d.get("children", []))
+    for d in walk(info["blockdevices"]):
+        fs = (d.get("fstype") or "").lower()
+        if fs == "bitlocker":
+            print(f"  {d['path']}: BitLocker-encrypted; unlock it first and pass --windows <mountpoint>")
+        if fs != "ntfs":
+            continue
+        if d.get("mountpoint"):
+            yield d["mountpoint"]
+            continue
+        mnt = tempfile.mkdtemp(prefix="goodix-win-", dir="/run")
+        ok = any(subprocess.run(["mount", "-t", t, "-o", "ro", d["path"], mnt],
+                                capture_output=True).returncode == 0 for t in ("ntfs3", "ntfs-3g"))
+        if not ok:
+            print(f"  {d['path']}: could not mount read-only (hibernated / Fast Startup?)")
+            os.rmdir(mnt)
+            continue
+        try:
+            yield mnt
+        finally:
+            subprocess.run(["umount", mnt], check=False)
+            os.rmdir(mnt)
+
+
+def find_ci(root, *parts):
+    """Case-insensitive path lookup."""
+    cur = root
+    for p in parts:
+        try:
+            match = next((e for e in os.listdir(cur) if e.lower() == p.lower()), None)
+        except OSError:
+            return None
+        if match is None:
+            return None
+        cur = os.path.join(cur, match)
+    return cur
+
+
+def decrypt_record(win, record, validator):
+    from impacket.examples.secretsdump import LocalOperations, LSASecrets
+    from impacket.dpapi import MasterKeyFile, MasterKey, DPAPI_BLOB
+
+    system = find_ci(win, "Windows", "System32", "config", "SYSTEM")
+    security = find_ci(win, "Windows", "System32", "config", "SECURITY")
+    if not system or not security:
+        return None
+    mkid = str(uuid.UUID(bytes_le=record[24:40]))
+    mk_path = None
+    for base in (("Windows", "System32", "Microsoft", "Protect"),
+                 ("Windows", "ServiceProfiles", "LocalService", "AppData", "Roaming", "Microsoft", "Protect"),
+                 ("Windows", "ServiceProfiles", "NetworkService", "AppData", "Roaming", "Microsoft", "Protect"),
+                 ("Windows", "System32", "config", "systemprofile", "AppData", "Roaming", "Microsoft", "Protect")):
+        d = find_ci(win, *base)
+        if d:
+            hits = [p for p in glob.glob(os.path.join(d, "**", "*"), recursive=True)
+                    if os.path.basename(p).lower() == mkid]
+            if hits:
+                mk_path = hits[0]
+                break
+    if not mk_path:
+        print(f"  master key {mkid} not found on this Windows install")
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="goodix-hives-") as tmp:
+        os.chmod(tmp, 0o700)
+        shutil.copy(system, os.path.join(tmp, "SYSTEM"))
+        shutil.copy(security, os.path.join(tmp, "SECURITY"))
+        bootkey = LocalOperations(os.path.join(tmp, "SYSTEM")).getBootKey()
+        keys = {}
+
+        def grab(_t, secret):
+            if secret.startswith("dpapi_machinekey:"):
+                for line in secret.split("\n"):
+                    k, v = line.split(":", 1)
+                    keys[k] = bytes.fromhex(v.strip()[2:])
+        with open(os.devnull, "w") as null, contextlib.redirect_stdout(null):
+            lsa = LSASecrets(os.path.join(tmp, "SECURITY"), bootkey, isRemote=False,
+                             history=False, perSecretCallback=grab)
+            lsa.dumpSecrets()
+            lsa.finish()
+    if not keys:
+        print("  DPAPI_SYSTEM secret not found")
+        return None
+
+    data = open(mk_path, "rb").read()
+    mkf = MasterKeyFile(data)
+    mk = MasterKey(data[len(mkf):][:mkf["MasterKeyLen"]])
+    master = None
+    for k in ("dpapi_userkey", "dpapi_machinekey"):
+        master = mk.decrypt(keys[k])
+        if master:
+            break
+    if not master:
+        print("  could not decrypt the master key")
+        return None
+    plain = DPAPI_BLOB(record[:324]).decrypt(master)
+    if not plain:
+        print("  could not decrypt the pairing record")
+        return None
+    for cand in (plain, plain[:32], plain[-32:]):
+        if hashlib.sha256(cand).digest() == validator:
+            return cand
+    print("  decrypted, but the result does not match the sensor (Windows re-paired since?)")
+    return None
+
+
+def cmd_pair(args):
+    with fprintd_stopped():
+        s = Sensor()
+        try:
+            fw = s.firmware()
+            if not fw.startswith("GFUSB_GM168SEC_APP_100"):
+                die(f"unsupported firmware {fw}")
+            record, validator = read_pairing(s)
+        finally:
+            s.close()
+    print(f"sensor firmware {fw}; looking for the Windows install that paired it...")
+    for win in windows_roots(args.windows):
+        print(f"  trying {win}")
+        psk = decrypt_record(win, record, validator)
+        if psk:
+            path = write_state("psk.bin", psk)
+            print(f"\nOK: pairing key recovered and verified against the sensor -> {path}")
+            print("Next: goodix52xd-setup calibrate")
+            return
+    die("no Windows install could decrypt the sensor's pairing record")
+
+
+def cmd_calibrate(args):
+    try:
+        psk = open(os.path.join(STATE_DIR, "psk.bin"), "rb").read()
+    except FileNotFoundError:
+        die("no pairing key; run: goodix52xd-setup pair")
+    n = args.touches
+    frames = []
+    with fprintd_stopped():
+        s = Sensor()
+        try:
+            s.start_session(psk)
+            print(f"Touch the sensor {n} times. Use different fingers and positions;\n"
+                  "lift fully between touches.\n")
+            while len(frames) < n:
+                while coverage(s.frame()) > 0.03:
+                    time.sleep(0.1)
+                print(f"[{len(frames) + 1}/{n}] >>> TOUCH <<<", flush=True)
+                hits = 0
+                while hits < 2:
+                    hits = hits + 1 if coverage(s.frame()) >= 0.6 else 0
+                    time.sleep(0.05)
+                time.sleep(0.3)
+                px = s.frame()
+                if coverage(px) >= 0.6:
+                    frames.append(px)
+                    print("    ok - lift", flush=True)
+                else:
+                    print("    moved - try again", flush=True)
+        finally:
+            s.close()
+    fpn = [sum(f[i] for f in frames) / len(frames) for i in range(W * H)]
+    path = write_state("fpn.bin", struct.pack(f"<{W * H}f", *fpn))
+    print(f"\nOK: fixed pattern saved -> {path}")
+    print("Next (as your user): fprintd-enroll   then   fprintd-verify")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("pair")
+    p.add_argument("--windows", help="path of an already-mounted Windows partition")
+    p.set_defaults(fn=cmd_pair)
+    c = sub.add_parser("calibrate")
+    c.add_argument("--touches", type=int, default=20)
+    c.set_defaults(fn=cmd_calibrate)
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        die("run as root (sudo)")
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
