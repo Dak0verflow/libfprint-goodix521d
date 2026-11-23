@@ -139,6 +139,7 @@ driver_sources = {
     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
     'mafpmoc' : files('drivers/mafpmoc/mafpmoc.c'),
     'secugen' : files('drivers/secugen.c'),
+    'goodixtls52xd' : files('drivers/goodixtls/goodix52xd.c', 'drivers/goodixtls/goodix52xd_match.cpp'),
 }
 
 helper_sources = {
@@ -146,6 +147,8 @@ helper_sources = {
     'aesx660': files('drivers/aesx660.c'),
     'aes3k': files('drivers/aes3k.c'),
     'openssl': files(),
+    'opencv': files(),
+    'goodixtls': files('drivers/goodixtls/goodix_proto.c', 'drivers/goodixtls/goodix.c', 'drivers/goodixtls/goodixtls.c'),
     'pixman': files(),
     'udev': files(),
     'virtual': files('drivers/virtual-device-listener.c'),

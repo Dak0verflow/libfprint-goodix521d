@@ -147,6 +147,7 @@ drivers_info = {
     'focaltech_moc': {},
     'mafpmoc': {},
     'secugen': {},
+    'goodixtls52xd': { 'helper': ['goodixtls', 'openssl', 'opencv'] },
 
     # SPI driver (non-optional if SPI is available)
     'elanspi': { 'spi': true, 'helper': ['udev'], 'optional': not have_spi },
@@ -243,6 +244,15 @@ foreach i : driver_helpers
         endif
 
         optional_deps += openssl_dep
+    elif i == 'opencv'
+        opencv_dep = dependency('opencv5', required: false)
+        if not opencv_dep.found()
+            opencv_dep = dependency('opencv4', required: false)
+        endif
+        if not opencv_dep.found()
+            error('OpenCV is required for @0@'.format(driver))
+        endif
+        optional_deps += opencv_dep
     elif i == 'udev'
         install_udev_rules = true
 
