@@ -50,8 +50,8 @@ fprintd-verify
 ```
 
 On KDE Plasma you can enroll from the GUI instead: **System Settings → Users →
-Configure Fingerprint Authentication**. KDE's login and lock screen use the
-fingerprint out of the box.
+Configure Fingerprint Authentication**. KDE's lock screen uses the fingerprint out
+of the box; for the boot login screen see `--login` below.
 
 To undo: `sudo pacman -S libfprint`, then optionally
 `sudo rm -r /var/lib/fprint/goodixtls52xd`.
@@ -69,7 +69,16 @@ Goodix driver), the driver reports "Sensor pairing key changed". Re-run
 sudo goodix52xd-pam            # terminal sudo
 sudo goodix52xd-pam polkit-1   # KDE/GNOME admin popups (e.g. Partition Manager)
 sudo goodix52xd-pam polkit-1 --undo
+sudo goodix52xd-pam sddm --login   # boot login screen, see below
 ```
+
+**Boot login screen (SDDM).** KDE's lock screen supports the fingerprint out
+of the box, but the SDDM login screen after a reboot does not. SDDM has no
+fingerprint prompt and only runs PAM after you press Enter, so `--login` mode
+works differently: **type your password as usual, or press Enter on an empty
+password field and then touch the sensor.** A fingerprint login cannot unlock a
+password-encrypted KDE Wallet, so KDE asks for the wallet password once after
+such a login.
 
 For services whose PAM file only exists in `/usr/lib/pam.d` (like `polkit-1`),
 it creates an override in `/etc/pam.d`, so package updates don't revert it.
