@@ -1,22 +1,42 @@
 #!/bin/bash
 # Opt-in: allow fingerprint for a PAM service, with password fallback.
-#   sudo goodix52xd-pam [service]          (default: sudo)
+#   sudo goodix52xd-pam [service]                (default: sudo)
+#   sudo goodix52xd-pam [service] --login        login screens (sddm, ...)
 #   sudo goodix52xd-pam [service] --undo
-# e.g. service = sudo, polkit-1 (KDE admin popups)
+#
+# Default mode: fingerprint first (3 tries / 15 s), then password.
+#   For sudo, polkit-1 (KDE admin popups), ...
+# --login mode: type your password as usual, OR submit an EMPTY password to
+#   use the fingerprint. For display managers such as sddm, whose greeter has
+#   no fingerprint prompt and only runs PAM after you press Enter. A
+#   fingerprint login cannot unlock a password-encrypted KWallet.
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
-SVC="sudo"; UNDO=0
+SVC="sudo"; UNDO=0; LOGIN=0
 for a in "$@"; do
-    case "$a" in --undo) UNDO=1 ;; *) SVC="$a" ;; esac
+    case "$a" in
+        --undo) UNDO=1 ;;
+        --login) LOGIN=1 ;;
+        -*) echo "unknown option $a"; exit 1 ;;
+        *) SVC="$a" ;;
+    esac
 done
 F="/etc/pam.d/$SVC"
 VENDOR="/usr/lib/pam.d/$SVC"
 MARK="/etc/pam.d/.$SVC.created-by-goodix521d"
-LINE="auth       sufficient   pam_fprintd.so max-tries=3 timeout=15"
+BEGIN="# goodix52xd-pam begin"
+END="# goodix52xd-pam end"
+FPRINT="auth       sufficient   pam_fprintd.so max-tries=3 timeout=15"
+# Password typed: pam_unix succeeds and skips the fingerprint line (the normal
+# stack below then runs unchanged). Empty password: pam_unix fails, so
+# pam_fprintd is tried.
+UNIX_GATE="auth       [success=1 new_authtok_reqd=1 default=ignore]  pam_unix.so try_first_pass likeauth nullok"
 
 if [ "$UNDO" = 1 ]; then
     if [ -e "$MARK" ]; then
         rm -f "$F" "$MARK"; echo "removed override $F (vendor $VENDOR applies again)"
+    elif grep -qF "$BEGIN" "$F"; then
+        sed -i "/^$BEGIN\$/,/^$END\$/d" "$F"; echo "removed fingerprint block from $F"
     else
         sed -i '/pam_fprintd.so/d' "$F"; echo "removed fingerprint from $F"
     fi
@@ -28,9 +48,15 @@ if [ ! -e "$F" ]; then
     cp -a "$VENDOR" "$F"; touch "$MARK"
     echo "created $F from $VENDOR (overrides it; survives package updates)"
 fi
-grep -q pam_fprintd.so "$F" && { echo "already enabled in $F"; exit 0; }
+grep -q pam_fprintd.so "$F" && { echo "already enabled in $F (use --undo first to change mode)"; exit 0; }
 cp -a "$F" "$F.bak-goodix521d"
-# insert before the first auth line so fingerprint is tried first, password after
-awk -v l="$LINE" 'BEGIN{d=0} /^auth/ && !d {print l; d=1} {print}' "$F.bak-goodix521d" > "$F"
-echo "enabled for '$SVC'. $F now starts with:"; grep -n "^auth" "$F" | head -3
+if [ "$LOGIN" = 1 ]; then
+    BLOCK="$BEGIN"$'\n'"$UNIX_GATE"$'\n'"$FPRINT"$'\n'"$END"
+else
+    BLOCK="$BEGIN"$'\n'"$FPRINT"$'\n'"$END"
+fi
+# insert before the first auth line
+awk -v b="$BLOCK" 'BEGIN{d=0} /^auth/ && !d {print b; d=1} {print}' "$F.bak-goodix521d" > "$F"
+echo "enabled for '$SVC'$([ "$LOGIN" = 1 ] && echo ' (login mode: empty password = fingerprint)'). $F now starts with:"
+grep -n "^auth\|goodix52xd-pam" "$F" | head -5
 echo "backup: $F.bak-goodix521d   (keep a root shell open while testing: sudo -s)"
